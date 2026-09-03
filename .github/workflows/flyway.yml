@@ -1,0 +1,99 @@
+name: "Flyway / Migrate on Merge"
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - 'environments/**/sql/**'
+      - 'environments/**/*.conf'
+
+env:
+  FLYWAY_VERSION: "13.4.0"
+  SLACK_WEBHOOK_URL: ${{ secrets.SLACK_DBA_WEBHOOK_URL }}
+
+jobs:
+  # ---- Detect which environment folder(s) changed in this push ----
+  detect-changes:
+    runs-on: [on-prem-vm]
+    outputs:
+      envs: ${{ steps.filter.outputs.changes }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Detect changed environment folders
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          # Add one line here per environment folder that exists in this repo.
+          filters: |
+            dev:  'environments/dev/**'
+            uat:  'environments/uat/**'
+            pqa:  'environments/pqa/**'
+            prod: 'environments/prod/**'
+
+  # ---- Migrate only the environment(s) whose folder changed ----
+  flyway-migrate:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.envs != '[]'
+    runs-on: [on-prem-vm]
+    strategy:
+      matrix:
+        env_name: ${{ fromJSON(needs.detect-changes.outputs.envs) }}
+      fail-fast: false
+    # Ties this run to the matching GitHub Environment (dev/uat/prod/...),
+    # which is where the PG_USER / PG_PASSWORD secrets and any required
+    # approvals for that environment are configured.
+    environment: ${{ matrix.env_name }}
+    timeout-minutes: 15
+
+    env:
+      FLYWAY_USER: ${{ secrets.PG_USER }}
+      FLYWAY_PASSWORD: ${{ secrets.PG_PASSWORD }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ---- Install Flyway fresh on whichever runner picks this job up ----
+      - name: Cache Flyway CLI
+        id: flyway-cache
+        uses: actions/cache@v4
+        with:
+          path: flyway-${{ env.FLYWAY_VERSION }}
+          key: flyway-${{ env.FLYWAY_VERSION }}-${{ runner.os }}
+
+      - name: Download Flyway CLI (cache miss)
+        if: steps.flyway-cache.outputs.cache-hit != 'true'
+        run: |
+          curl -L --connect-timeout 10 --max-time 60 --retry 3 -o flyway.tar.gz \
+            "https://github.com/flyway/flyway/releases/download/flyway-${FLYWAY_VERSION}/flyway-commandline-${FLYWAY_VERSION}-linux-x64.tar.gz"
+          tar -xzf flyway.tar.gz
+
+      - name: Add Flyway to PATH
+        run: echo "$PWD/flyway-${FLYWAY_VERSION}" >> "$GITHUB_PATH"
+
+      # ---- Preview what's pending before touching anything ----
+      - name: Flyway info (pending migrations preview)
+        run: flyway -configFiles=environments/${{ matrix.env_name }}/${{ matrix.env_name }}.conf info
+
+      # ---- Apply pending migrations ----
+      - name: Flyway migrate
+        id: migrate
+        run: flyway -configFiles=environments/${{ matrix.env_name }}/${{ matrix.env_name }}.conf migrate
+
+      # ---- Notify Slack on success/failure ----
+      - name: Notify Slack on success
+        if: success()
+        run: |
+          curl -X POST -H 'Content-type: application/json' \
+            --data "{\"text\":\"✅ Flyway migration applied successfully to ${{ matrix.env_name }} on merge to master. Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}\"}" \
+            "$SLACK_WEBHOOK_URL"
+
+      - name: Notify Slack on failure
+        if: failure()
+        run: |
+          curl -X POST -H 'Content-type: application/json' \
+            --data "{\"text\":\"❌ Flyway migration FAILED on ${{ matrix.env_name }} on merge to master. Check the run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}\"}" \
+            "$SLACK_WEBHOOK_URL"
