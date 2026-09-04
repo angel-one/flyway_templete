@@ -10,7 +10,7 @@ on:
 
 env:
   FLYWAY_VERSION: "13.4.0"
-  SLACK_WEBHOOK_URL: ${{ secrets.SLACK_DBA_WEBHOOK_URL }}
+  SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
 
 jobs:
   # ---- Detect which environment folder(s) changed in this push ----
